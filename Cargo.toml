@@ -1,0 +1,56 @@
+[package]
+name = "novmforbroadcom"
+version = "0.2.0"
+edition = "2021"
+description = "VM detection library – detect hypervisors, sandboxes, and virtual machines with syscall-spoofed Windows NT calls (Hell's Gate) to evade AV/EDR hooks."
+authors = ["kernelwernel <https://github.com/kernelwernel/VMAware>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/kernelwernel/VMAware"
+homepage = "https://github.com/kernelwernel/VMAware"
+documentation = "https://docs.rs/vmaware"
+keywords = ["vm-detection", "hypervisor", "virtual-machine", "sandbox", "security"]
+categories = ["os", "development-tools::debugging"]
+exclude = [
+    "target/",
+    "*.drawio",
+]
+
+[[bin]]
+name = "vmaware"
+path = "src/main.rs"
+
+[lib]
+name = "vmaware"
+path = "src/lib.rs"
+
+[dependencies]
+
+[target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies]
+raw-cpuid = "11"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.52"
+features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Power",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Environment",
+]
