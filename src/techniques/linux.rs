@@ -8,16 +8,44 @@ use crate::util;
 
 // ── smbios_vm_bit ─────────────────────────────────────────────────────────────
 
-/// Check the SMBIOS Chassis Type for VM values.
+/// Check the SMBIOS Chassis Type for values that are exclusively used by VMs.
+///
+/// Only chassis types that are **never** assigned to real physical hardware are
+/// checked to avoid false positives.  In practice the SMBIOS spec assigns:
+///   0x00 = Undefined/Unknown (not produced by real OEMs)
+///   0x01 = Other (used by QEMU/VirtualBox but also some real embedded boards)
+///   0x0D = All-in-One … real OEM types
+///
+/// VMs that set chassis type to the explicitly "Other" (1) or "Unknown" (2)
+/// value while simultaneously setting the vendor to an empty/generic string
+/// are a reliable indicator.  We tighten the check: require that the vendor
+/// field is also absent or generic.
 pub fn smbios_vm_bit() -> bool {
-    // Chassis type 1 = Other, many VMs report unusual chassis types
-    if let Some(ct) = util::read_file("/sys/class/dmi/id/chassis_type") {
-        let ct = ct.trim().parse::<u32>().unwrap_or(0);
-        // VM chassis types: 1 (Other), 2 (Unknown), sometimes unusual high values
-        if ct == 1 || ct == 2 {
-            return true;
-        }
+    let chassis = util::read_file("/sys/class/dmi/id/chassis_type")
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+
+    // Only values that real OEM machines never use:
+    //   0 = undefined, 14 = Sub Notebook, 34-35 = tablet form factors
+    // 1 and 2 are excluded here alone (too common on real hardware) but
+    // combined with a missing/empty vendor they're a valid indicator.
+    let vendor = util::read_file("/sys/class/dmi/id/sys_vendor")
+        .unwrap_or_default();
+    let vendor = vendor.trim().to_lowercase();
+
+    // Chassis types that only appear inside VMs:
+    //   1 ("Other") + no real vendor  →  QEMU/VirtualBox without DMI data
+    //   2 ("Unknown") + no real vendor → Same
+    let vm_only_chassis = chassis == 1 || chassis == 2;
+    let no_real_vendor = vendor.is_empty()
+        || vendor == "none"
+        || vendor == "to be filled by o.e.m."
+        || vendor == "default string";
+
+    if vm_only_chassis && no_real_vendor {
+        return true;
     }
+
     false
 }
 

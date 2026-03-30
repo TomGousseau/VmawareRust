@@ -20,8 +20,19 @@ pub fn vmid() -> bool {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        // Probe leaves 0x40000000 through 0x40000010
-        for leaf in (0x4000_0000u32..=0x4000_0010).step_by(0x10) {
+        // Leaf 0x40000000 EAX returns the maximum hypervisor leaf supported.
+        // Probe every leaf from 0x40000000 up to that max (capped at
+        // 0x40000100 as a safety bound) so we don't miss hypervisors that
+        // respond at intermediate leaves (e.g. Xen at 0x40000100,
+        // some KVM builds at 0x40000001-0x4000000A).
+        let max_hvleaf = cpu::cpuid(0x4000_0000, 0).eax;
+        let end = if max_hvleaf >= 0x4000_0000 && max_hvleaf <= 0x4000_0100 {
+            max_hvleaf
+        } else {
+            0x4000_0010 // safe fallback if EAX looks unexpected
+        };
+
+        for leaf in 0x4000_0000u32..=end {
             let (found, brand) = cpu::vmid_template(leaf);
             if found {
                 add_brand_score(brand, 0);
