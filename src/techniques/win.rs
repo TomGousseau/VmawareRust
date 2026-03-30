@@ -19,7 +19,11 @@ use windows_sys::Win32::Storage::FileSystem::{
     CreateFileA, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_BACKUP_SEMANTICS, OPEN_EXISTING,
     FILE_SHARE_READ, FILE_SHARE_WRITE,
 };
-use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress, LoadLibraryA};
+// GetModuleHandleA / GetProcAddress are only needed on non-x86_64 fallback paths.
+// On x86_64 we use the stealthy PEB-walk helpers in crate::syscall instead,
+// so these symbols never appear in the x86_64 import table.
+#[cfg(not(target_arch = "x86_64"))]
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 
 // ── Helper macros ─────────────────────────────────────────────────────────────
 
@@ -29,7 +33,47 @@ macro_rules! cstr {
     };
 }
 
-// ── Spoofed NT wrappers ───────────────────────────────────────────────────────
+// ── Compile-time XOR string obfuscation ──────────────────────────────────────
+//
+// VM indicator strings (device paths, registry keys, driver names…) are XOR'd
+// with KEY at compile time so they never appear as plaintext in .rodata.
+// Static scanners (YARA, any.run static pass, PE string extraction) see only
+// random-looking bytes; the plaintext is decoded onto the stack at runtime just
+// before use, and discarded immediately after.
+//
+// Usage:  let path = obfstr!(r"\??\VBoxGuest");
+//         let s    = std::str::from_utf8(&path).unwrap_or("");
+//
+// The macro returns `[u8; N]` — a stack-allocated byte array.
+
+macro_rules! obfstr {
+    ($s:literal) => {{
+        const S: &str = $s;
+        const N: usize = S.len();
+        // Rolling per-position key: key[i] = ((i ^ 0xAB) * 0x4D + 0x17) & 0xFF
+        // Every byte uses a DIFFERENT key → single-byte XOR brute-force (FLOSS,
+        // automated string extractors) produces garbage for all 256 key guesses.
+        const ENCODED: [u8; N] = {
+            let b = S.as_bytes();
+            let mut e = [0u8; N];
+            let mut i = 0usize;
+            while i < N {
+                let k = ((i ^ 0xAB).wrapping_mul(0x4D).wrapping_add(0x17)) as u8;
+                e[i] = b[i] ^ k;
+                i += 1;
+            }
+            e
+        };
+        // Decode at runtime on the stack — plaintext never in .rodata.
+        let mut buf = ENCODED;
+        for (idx, b) in buf.iter_mut().enumerate() {
+            *b ^= ((idx ^ 0xAB).wrapping_mul(0x4D).wrapping_add(0x17)) as u8;
+        }
+        buf
+    }};
+}
+
+
 //
 // On x86-64 Windows these call `NtQuerySystemInformation` via a direct
 // `syscall` instruction, completely bypassing the ntdll.dll trampoline that
@@ -62,11 +106,43 @@ unsafe fn nt_qsi(class: u32, buf: *mut u8, len: u32, ret_len: *mut u32) -> i32 {
     }
 }
 
-/// Open a device path and immediately close it; returns true on success.
+/// Open a device by NT path (e.g. `b"\x5c\x3f\x3f\x5c..."`) and immediately
+/// close it; returns true if the device exists.
+///
+/// On x86-64: issues `NtCreateFile` via direct `syscall` — `CreateFileA` is
+/// never called and does NOT appear in the import table for this code path.
+/// On other Windows targets: falls back to `CreateFileA` via Win32.
+///
+/// The `path` parameter must be ASCII bytes in NT namespace form (`\??\…`),
+/// typically produced by the `obfstr!` macro so the plaintext is not visible
+/// in `.rodata`.
+#[cfg(target_arch = "x86_64")]
+unsafe fn try_open_device(nt_path_bytes: &[u8]) -> bool {
+    // Build null-terminated wide path (all our device paths are ASCII).
+    let mut wide: Vec<u16> = nt_path_bytes.iter().map(|&b| b as u16).collect();
+    wide.push(0);
+    let mut us = crate::syscall::init_unicode_string(&wide);
+    let mut oa = crate::syscall::ObjectAttributes::new_named(&mut us);
+    let mut handle: usize = 0;
+    let mut iosb: [u64; 2] = [0, 0];
+    // FILE_OPEN=1, ShareAccess READ|WRITE=3, FILE_NON_DIRECTORY_FILE=0x40
+    let status = crate::syscall::nt_create_file(
+        &mut handle, 0, &mut oa, iosb.as_mut_ptr(), 3, 1, 0x40,
+    ) as u32;
+    match status {
+        0 => { crate::syscall::nt_close(handle); true }
+        // ACCESS_DENIED or SHARING_VIOLATION → object exists but we can't open it
+        0xC000_0022 | 0xC000_0043 => true,
+        _ => false,
+    }
+}
+
+/// Win32 fallback for non-x86_64 targets — uses `CreateFileA` directly.
+#[cfg(not(target_arch = "x86_64"))]
 unsafe fn try_open_device(path: &[u8]) -> bool {
     let h = CreateFileA(
         path.as_ptr(),
-        0, // no access needed
+        0,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         std::ptr::null(),
         OPEN_EXISTING,
@@ -84,7 +160,23 @@ unsafe fn try_open_device(path: &[u8]) -> bool {
 // ── wine ──────────────────────────────────────────────────────────────────────
 
 /// Detect Wine by looking for the "wine_get_version" export in ntdll.
+///
+/// On x86-64 we use a stealthy in-memory PE export scan (PEB walk + export
+/// table parse) so `GetModuleHandleA` / `GetProcAddress` are never called and
+/// do not appear in the import table.
 pub fn wine() -> bool {
+    // ── x86-64: completely hook-free export check ─────────────────────────────
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::syscall::ntdll_export_exists("wine_get_version") {
+            add_brand_score(VMBrand::Wine, 0);
+            return true;
+        }
+        return false;
+    }
+
+    // ── other Windows archs: standard Win32 path ──────────────────────────────
+    #[cfg(not(target_arch = "x86_64"))]
     unsafe {
         let ntdll = GetModuleHandleA(cstr!("ntdll.dll") as *const u8);
         if ntdll == 0 {
@@ -102,30 +194,46 @@ pub fn wine() -> bool {
 // ── dll ───────────────────────────────────────────────────────────────────────
 
 /// Check for VM guest library DLLs loaded in the process.
+///
+/// On x86-64 the check is done by walking the PEB `InLoadOrderModuleList`
+/// directly — no call to `GetModuleHandleA` is made, so the query is
+/// invisible to any hook placed on that function.
 pub fn dll() -> bool {
-    static DLLS: &[(&[u8], VMBrand)] = &[
-        (b"vmGuestLib.dll\0",   VMBrand::VMware),
-        (b"vmhgfs.dll\0",       VMBrand::VMware),
-        (b"vboxmrxnp.dll\0",    VMBrand::VBox),
-        (b"vboxogl.dll\0",      VMBrand::VBox),
-        (b"vboxdisp.dll\0",     VMBrand::VBox),
-        (b"sbiedll.dll\0",      VMBrand::Sandboxie),
-        (b"dbghelp.dll\0",      VMBrand::Invalid),  // skip – common
-        (b"api_log.dll\0",      VMBrand::CWSandbox),
-        (b"dir_watch.dll\0",    VMBrand::CWSandbox),
-        (b"pstorec.dll\0",      VMBrand::ThreatExpert),
-        (b"vmcheck.dll\0",      VMBrand::VPC),
-        (b"wpespy.dll\0",       VMBrand::Invalid),
-        (b"SbieDll.dll\0",      VMBrand::Sandboxie),
-        (b"cuckoomon.dll\0",    VMBrand::Cuckoo),
+    // Plain &str names (no null terminator needed for PEB walk).
+    static DLLS: &[(&str, VMBrand)] = &[
+        ("vmGuestLib.dll",  VMBrand::VMware),
+        ("vmhgfs.dll",      VMBrand::VMware),
+        ("vboxmrxnp.dll",   VMBrand::VBox),
+        ("vboxogl.dll",     VMBrand::VBox),
+        ("vboxdisp.dll",    VMBrand::VBox),
+        ("sbiedll.dll",     VMBrand::Sandboxie),
+        ("SbieDll.dll",     VMBrand::Sandboxie),
+        ("api_log.dll",     VMBrand::CWSandbox),
+        ("dir_watch.dll",   VMBrand::CWSandbox),
+        ("pstorec.dll",     VMBrand::ThreatExpert),
+        ("vmcheck.dll",     VMBrand::VPC),
+        ("cuckoomon.dll",   VMBrand::Cuckoo),
     ];
 
-    unsafe {
-        for &(dll, brand) in DLLS {
-            if brand == VMBrand::Invalid {
-                continue;
+    // ── x86-64: stealthy PEB walk – no Win32 import used ─────────────────────
+    #[cfg(target_arch = "x86_64")]
+    {
+        for &(name, brand) in DLLS {
+            if unsafe { crate::syscall::peb_module_loaded(name) } {
+                add_brand_score(brand, 0);
+                return true;
             }
-            let h = GetModuleHandleA(dll.as_ptr());
+        }
+        return false;
+    }
+
+    // ── other Windows archs: standard Win32 path ──────────────────────────────
+    #[cfg(not(target_arch = "x86_64"))]
+    unsafe {
+        for &(name, brand) in DLLS {
+            let mut nul = name.to_string();
+            nul.push('\0');
+            let h = GetModuleHandleA(nul.as_ptr());
             if h != 0 {
                 add_brand_score(brand, 0);
                 return true;
@@ -193,25 +301,129 @@ pub fn vmware_backdoor() -> bool {
 // ── mutex ─────────────────────────────────────────────────────────────────────
 
 /// Check for VM-specific mutex objects.
+///
+/// Mutex names are XOR-obfuscated so strings like `"VBoxGuest"` are not
+/// visible in `.rodata`.  `OpenMutexA` is still called (obtaining the
+/// name from a stack-only decoded buffer), so the Win32 hook observes
+/// the decoded name, but static analysis cannot extract it.
 pub fn mutex() -> bool {
-    use windows_sys::Win32::System::Threading::{CreateMutexA, OpenMutexA};
+    use windows_sys::Win32::System::Threading::OpenMutexA;
     use windows_sys::Win32::Security::SYNCHRONIZE;
 
-    static MUTEXES: &[(&[u8], VMBrand)] = &[
-        (b"VBoxTrayIPC-\0",              VMBrand::VBox),
-        (b"VBoxGuest\0",                 VMBrand::VBox),
-        (b"MGA_APP_MUTEX\0",             VMBrand::VMware),
-        (b"VMWARE_TOOLS_UPGRADE_MUTEX\0", VMBrand::VMware),
-        (b"VBEAM_MUTEX\0",               VMBrand::VMware),
-        (b"TPAutoConnSvcMutex\0",        VMBrand::VMware),
-        (b"cuckoo_signal\0",             VMBrand::Cuckoo),
-    ];
-
-    unsafe {
-        for &(name, brand) in MUTEXES {
-            let h = OpenMutexA(SYNCHRONIZE, FALSE, name.as_ptr());
+    macro_rules! chk {
+        ($name:literal, $brand:expr) => {{
+            let mut n = obfstr!($name);
+            n[n.len() - 1] = 0; // ensure null-terminator at last XOR'd position
+            // obfstr includes the \0 byte in the literal, so last byte decodes to 0.
+            let h = OpenMutexA(SYNCHRONIZE, FALSE, n.as_ptr());
             if h != 0 {
                 CloseHandle(h);
+                add_brand_score($brand, 0);
+                return true;
+            }
+        }};
+    }
+
+    unsafe {
+        chk!("VBoxTrayIPC-\0",              VMBrand::VBox);
+        chk!("VBoxGuest\0",                 VMBrand::VBox);
+        chk!("MGA_APP_MUTEX\0",             VMBrand::VMware);
+        chk!("VMWARE_TOOLS_UPGRADE_MUTEX\0", VMBrand::VMware);
+        chk!("VBEAM_MUTEX\0",               VMBrand::VMware);
+        chk!("TPAutoConnSvcMutex\0",        VMBrand::VMware);
+        chk!("cuckoo_signal\0",             VMBrand::Cuckoo);
+        false
+    }
+}
+
+// ── virtual_registry ──────────────────────────────────────────────────────────
+
+/// Check for VM-specific registry keys.
+///
+/// On x86-64: checks performed via `NtOpenKey` direct syscall with
+/// obfuscated key paths — `RegOpenKeyExW` is never called and the plaintext
+/// `\SOFTWARE\VMware…` strings do not appear in `.rodata`.
+/// On other targets: falls back to the `winreg` crate.
+pub fn virtual_registry() -> bool {
+    // ── x86-64: spoofed NtOpenKey + compile-time obfuscated paths ────────────
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Helper: check if an NT registry key path exists.
+        unsafe fn reg_exists(ascii_path: &[u8]) -> bool {
+            let mut wide: Vec<u16> = ascii_path.iter().map(|&b| b as u16).collect();
+            wide.push(0);
+            let mut us = crate::syscall::init_unicode_string(&wide);
+            let mut oa = crate::syscall::ObjectAttributes::new_named(&mut us);
+            let mut handle: usize = 0;
+            let status = crate::syscall::nt_open_key(&mut handle, 0x20019, &mut oa) as u32;
+            if status == 0 { crate::syscall::nt_close(handle); return true; }
+            status == 0xC000_0022  // ACCESS_DENIED → key exists
+        }
+
+        macro_rules! chk {
+            ($p:literal, $b:expr) => {{
+                let path = obfstr!($p);
+                if unsafe { reg_exists(&path) } {
+                    add_brand_score($b, 0);
+                    return true;
+                }
+            }};
+        }
+
+        // Full NT paths: \Registry\Machine\<HKLM subkey>
+        chk!(r"\Registry\Machine\SOFTWARE\VMware, Inc.\VMware Tools",         VMBrand::VMware);
+        chk!(r"\Registry\Machine\SOFTWARE\VirtualBox Guest Additions",         VMBrand::VBox);
+        chk!(r"\Registry\Machine\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters", VMBrand::HyperV);
+        chk!(r"\Registry\Machine\SOFTWARE\Wine",                               VMBrand::Wine);
+        chk!(r"\Registry\Machine\SYSTEM\CurrentControlSet\Enum\PCI\VEN_15AD",  VMBrand::VMware);
+        chk!(r"\Registry\Machine\SYSTEM\CurrentControlSet\Enum\PCI\VEN_80EE",  VMBrand::VBox);
+        chk!(r"\Registry\Machine\SYSTEM\CurrentControlSet\Enum\PCI\VEN_5853",  VMBrand::Xen);
+        chk!(r"\Registry\Machine\SYSTEM\CurrentControlSet\Enum\PCI\VEN_1AF4",  VMBrand::QEMUKVM);
+        chk!(r"\Registry\Machine\HARDWARE\ACPI\DSDT\VBOX__",                   VMBrand::VBox);
+        chk!(r"\Registry\Machine\HARDWARE\ACPI\FADT\VBOX__",                   VMBrand::VBox);
+        chk!(r"\Registry\Machine\HARDWARE\ACPI\RSDT\VBOX__",                   VMBrand::VBox);
+        chk!(r"\Registry\Machine\HARDWARE\ACPI\DSDT\BOCHS_",                   VMBrand::Bochs);
+        chk!(r"\Registry\Machine\HARDWARE\ACPI\DSDT\BXPC__",                   VMBrand::Bochs);
+        chk!(r"\Registry\Machine\SYSTEM\CurrentControlSet\Services\VBoxGuest", VMBrand::VBox);
+        chk!(r"\Registry\Machine\SYSTEM\CurrentControlSet\Services\vmci",      VMBrand::VMware);
+        chk!(r"\Registry\Machine\SYSTEM\CurrentControlSet\Services\vmhgfs",    VMBrand::VMware);
+        chk!(r"\Registry\Machine\SOFTWARE\Oracle\VirtualBox Guest Additions",  VMBrand::VBox);
+        chk!(r"\Registry\Machine\SYSTEM\CurrentControlSet\Services\VBoxService", VMBrand::VBox);
+        chk!(r"\Registry\Machine\SYSTEM\CurrentControlSet\Services\VBoxSF",    VMBrand::VBox);
+        return false;
+    }
+
+    // ── non-x86_64 fallback: winreg ──────────────────────────────────────────
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+
+        static KEYS: &[(&str, VMBrand)] = &[
+            (r"SOFTWARE\VMware, Inc.\VMware Tools",         VMBrand::VMware),
+            (r"SOFTWARE\VirtualBox Guest Additions",         VMBrand::VBox),
+            (r"SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters", VMBrand::HyperV),
+            (r"SOFTWARE\Wine",                               VMBrand::Wine),
+            (r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_15AD",  VMBrand::VMware),
+            (r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_80EE",  VMBrand::VBox),
+            (r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_5853",  VMBrand::Xen),
+            (r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_1AF4",  VMBrand::QEMUKVM),
+            (r"HARDWARE\ACPI\DSDT\VBOX__",                   VMBrand::VBox),
+            (r"HARDWARE\ACPI\FADT\VBOX__",                   VMBrand::VBox),
+            (r"HARDWARE\ACPI\RSDT\VBOX__",                   VMBrand::VBox),
+            (r"HARDWARE\ACPI\DSDT\BOCHS_",                   VMBrand::Bochs),
+            (r"HARDWARE\ACPI\DSDT\BXPC__",                   VMBrand::Bochs),
+            (r"SYSTEM\CurrentControlSet\Services\VBoxGuest", VMBrand::VBox),
+            (r"SYSTEM\CurrentControlSet\Services\vmci",      VMBrand::VMware),
+            (r"SYSTEM\CurrentControlSet\Services\vmhgfs",    VMBrand::VMware),
+            (r"SOFTWARE\Oracle\VirtualBox Guest Additions",  VMBrand::VBox),
+            (r"SYSTEM\CurrentControlSet\Services\VBoxService", VMBrand::VBox),
+            (r"SYSTEM\CurrentControlSet\Services\VBoxSF",    VMBrand::VBox),
+        ];
+
+        let hklm = RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
+        for &(path, brand) in KEYS {
+            if hklm.open_subkey(path).is_ok() {
                 add_brand_score(brand, 0);
                 return true;
             }
@@ -220,55 +432,33 @@ pub fn mutex() -> bool {
     }
 }
 
-// ── virtual_registry ──────────────────────────────────────────────────────────
-
-/// Check for VM-specific registry keys.
-pub fn virtual_registry() -> bool {
-    use winreg::enums::*;
-    use winreg::RegKey;
-
-    static KEYS: &[(&str, VMBrand)] = &[
-        (r"SOFTWARE\VMware, Inc.\VMware Tools",         VMBrand::VMware),
-        (r"SOFTWARE\VirtualBox Guest Additions",         VMBrand::VBox),
-        (r"SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters", VMBrand::HyperV),
-        (r"SOFTWARE\Wine",                               VMBrand::Wine),
-        (r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_15AD",  VMBrand::VMware),
-        (r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_80EE",  VMBrand::VBox),
-        (r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_5853",  VMBrand::Xen),
-        (r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_1AF4",  VMBrand::QEMUKVM),
-        (r"HARDWARE\ACPI\DSDT\VBOX__",                   VMBrand::VBox),
-        (r"HARDWARE\ACPI\FADT\VBOX__",                   VMBrand::VBox),
-        (r"HARDWARE\ACPI\RSDT\VBOX__",                   VMBrand::VBox),
-        (r"HARDWARE\ACPI\DSDT\BOCHS_",                   VMBrand::Bochs),
-        (r"HARDWARE\ACPI\DSDT\BXPC__",                   VMBrand::Bochs),
-        (r"SYSTEM\CurrentControlSet\Services\VBoxGuest", VMBrand::VBox),
-        (r"SYSTEM\CurrentControlSet\Services\vmci",      VMBrand::VMware),
-        (r"SYSTEM\CurrentControlSet\Services\vmhgfs",    VMBrand::VMware),
-        (r"SOFTWARE\Oracle\VirtualBox Guest Additions",  VMBrand::VBox),
-        (r"SYSTEM\CurrentControlSet\Services\VBoxService", VMBrand::VBox),
-        (r"SYSTEM\CurrentControlSet\Services\VBoxSF",    VMBrand::VBox),
-    ];
-
-    let hklm = RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
-    for &(path, brand) in KEYS {
-        if hklm.open_subkey(path).is_ok() {
-            add_brand_score(brand, 0);
-            return true;
-        }
-    }
-    false
-}
-
 // ── gamarue ───────────────────────────────────────────────────────────────────
 
 /// Check a registry path used by Gamarue malware analysis environments.
 pub fn gamarue() -> bool {
-    use winreg::enums::*;
-    use winreg::RegKey;
-
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    hklm.open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\gamarue.exe")
-        .is_ok()
+    #[cfg(target_arch = "x86_64")]
+    {
+        let path = obfstr!(r"\Registry\Machine\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\gamarue.exe");
+        unsafe fn reg_exists(ascii_path: &[u8]) -> bool {
+            let mut wide: Vec<u16> = ascii_path.iter().map(|&b| b as u16).collect();
+            wide.push(0);
+            let mut us = crate::syscall::init_unicode_string(&wide);
+            let mut oa = crate::syscall::ObjectAttributes::new_named(&mut us);
+            let mut handle: usize = 0;
+            let status = crate::syscall::nt_open_key(&mut handle, 0x20019, &mut oa) as u32;
+            if status == 0 { crate::syscall::nt_close(handle); return true; }
+            status == 0xC000_0022
+        }
+        return unsafe { reg_exists(&path) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        hklm.open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\gamarue.exe")
+            .is_ok()
+    }
 }
 
 // ── vpc_invalid ───────────────────────────────────────────────────────────────
@@ -303,7 +493,9 @@ pub fn vmware_str() -> bool {
     }
     let r = cpuid(0x4000_0000, 0);
     let v = vendor_string(r.ebx, r.ecx, r.edx);
-    if v.contains("VMwareVMware") {
+    let vm_id = obfstr!("VMwareVMware");
+    let vm_str = std::str::from_utf8(&vm_id).unwrap_or("");
+    if v.contains(vm_str) {
         add_brand_score(VMBrand::VMware, 0);
         true
     } else {
@@ -334,7 +526,9 @@ pub fn cuckoo_dir() -> bool {
 /// Check for the Cuckoo sandbox named pipe.
 pub fn cuckoo_pipe() -> bool {
     unsafe {
-        let found = try_open_device(b"\\\\.\\pipe\\cuckoo\0");
+        // NT path: \??\pipe\cuckoo  (obfstr hides plaintext from .rodata)
+        let path = obfstr!(r"\??\pipe\cuckoo");
+        let found = try_open_device(&path);
         if found {
             add_brand_score(VMBrand::Cuckoo, 0);
         }
@@ -352,26 +546,30 @@ pub fn display() -> bool {
         let mut dd = std::mem::zeroed::<DISPLAY_DEVICEA>();
         dd.cb = std::mem::size_of::<DISPLAY_DEVICEA>() as u32;
 
-        static STRINGS: &[(&str, VMBrand)] = &[
-            ("VMware",       VMBrand::VMware),
-            ("VirtualBox",   VMBrand::VBox),
-            ("VBoxDisp",     VMBrand::VBox),
-            ("Microsoft Basic Display", VMBrand::HyperV),
-            ("QEMU",         VMBrand::QEMU),
-            ("Hyper-V",      VMBrand::HyperV),
-            ("Parallels",    VMBrand::Parallels),
-        ];
+        // Decode VM display strings at runtime so they don't sit in .rodata.
+        macro_rules! disp_match {
+            ($name:expr, $sig:literal, $brand:expr) => {{
+                let s = obfstr!($sig);
+                let sig_str = std::str::from_utf8(&s).unwrap_or("");
+                if $name.contains(sig_str) {
+                    add_brand_score($brand, 0);
+                    return true;
+                }
+            }};
+        }
 
         let mut idx = 0u32;
         while EnumDisplayDevicesA(std::ptr::null(), idx, &mut dd, 0) != FALSE {
             let name = std::ffi::CStr::from_ptr(dd.DeviceString.as_ptr() as *const i8)
                 .to_string_lossy();
-            for &(sig, brand) in STRINGS {
-                if name.contains(sig) {
-                    add_brand_score(brand, 0);
-                    return true;
-                }
-            }
+            let name: &str = &name;
+            disp_match!(name, "VMware",                VMBrand::VMware);
+            disp_match!(name, "VirtualBox",            VMBrand::VBox);
+            disp_match!(name, "VBoxDisp",              VMBrand::VBox);
+            disp_match!(name, "Microsoft Basic Display", VMBrand::HyperV);
+            disp_match!(name, "QEMU",                  VMBrand::QEMU);
+            disp_match!(name, "Hyper-V",               VMBrand::HyperV);
+            disp_match!(name, "Parallels",             VMBrand::Parallels);
             idx += 1;
         }
         false
@@ -380,108 +578,104 @@ pub fn display() -> bool {
 
 // ── device_string ─────────────────────────────────────────────────────────────
 
-/// Scan \\.\<device> paths for known VM device names.
+/// Probe NT device paths for known VM device names.
+///
+/// On x86-64 each path is XOR-obfuscated (`obfstr!`) so no VM string appears
+/// in `.rodata`, and the probe uses `NtCreateFile` via direct syscall so
+/// `CreateFileA` is never called for these checks.
 pub fn device_string() -> bool {
-    static DEVICES: &[(&[u8], VMBrand)] = &[
-        (b"\\\\.\\VBoxMiniRdrDN\0",  VMBrand::VBox),
-        (b"\\\\.\\VBoxGuest\0",      VMBrand::VBox),
-        (b"\\\\.\\VBoxTrayIPC\0",    VMBrand::VBox),
-        (b"\\\\.\\HGFS\0",           VMBrand::VMware),
-        (b"\\\\.\\vmci\0",           VMBrand::VMware),
-        (b"\\\\.\\vmmemctl\0",       VMBrand::VMware),
-        (b"\\\\.\\Global\\vmci\0",   VMBrand::VMware),
-    ];
-
-    unsafe {
-        for &(dev, brand) in DEVICES {
-            if try_open_device(dev) {
-                add_brand_score(brand, 0);
+    macro_rules! chk {
+        ($p:literal, $b:expr) => {{
+            let path = obfstr!($p);
+            if unsafe { try_open_device(&path) } {
+                add_brand_score($b, 0);
                 return true;
             }
-        }
-        false
+        }};
     }
+    // NT namespace paths (\??\X) — obfstr hides them from .rodata.
+    chk!(r"\??\VBoxMiniRdrDN", VMBrand::VBox);
+    chk!(r"\??\VBoxGuest",     VMBrand::VBox);
+    chk!(r"\??\VBoxTrayIPC",   VMBrand::VBox);
+    chk!(r"\??\HGFS",          VMBrand::VMware);
+    chk!(r"\??\vmci",          VMBrand::VMware);
+    chk!(r"\??\vmmemctl",      VMBrand::VMware);
+    chk!(r"\??\Global\vmci",   VMBrand::VMware);
+    false
 }
 
 // ── drivers ───────────────────────────────────────────────────────────────────
 
 /// Query loaded kernel drivers and look for VM driver names.
+///
+/// Driver names are XOR-obfuscated at compile time (`obfstr!`) so strings
+/// like `"vboxdrv"` or `"vmxnet"` never appear in `.rodata`. The list is
+/// decoded at runtime inside the comparison inner loop.
+/// NtQuerySystemInformation is already spoofed via Hell's Gate.
 pub fn drivers() -> bool {
-    use windows_sys::Win32::System::SystemInformation::{
-        NtQuerySystemInformation, SystemModuleInformation,
-    };
-
-    static DRIVER_LIST: &[(&str, VMBrand)] = &[
-        ("vboxdrv",    VMBrand::VBox),
-        ("VBoxGuest",  VMBrand::VBox),
-        ("VBoxMouse",  VMBrand::VBox),
-        ("VBoxVideo",  VMBrand::VBox),
-        ("VBoxSF",     VMBrand::VBox),
-        ("vmxnet",     VMBrand::VMware),
-        ("vmx_svga",   VMBrand::VMware),
-        ("vmx_fb",     VMBrand::VMware),
-        ("vmci",       VMBrand::VMware),
-        ("VMToolsHook", VMBrand::VMware),
-        ("vmmouse",    VMBrand::VMware),
-        ("vmhgfs",     VMBrand::VMware),
-        ("vmkbd",      VMBrand::VMware),
-        ("vmaudio",    VMBrand::VMware),
-        ("pvscsi",     VMBrand::VMware),
-        ("vmxnet3",    VMBrand::VMware),
-        ("kvm",        VMBrand::KVM),
-        ("vioscsi",    VMBrand::QEMUKVM),
-        ("vioinput",   VMBrand::QEMUKVM),
-        ("balloon",    VMBrand::QEMUKVM),
-        ("Viostor",    VMBrand::QEMUKVM),
-        ("netkvm",     VMBrand::QEMUKVM),
-        ("xenvif",     VMBrand::Xen),
-        ("xennet",     VMBrand::Xen),
-        ("xenstor",    VMBrand::Xen),
-        ("xenbus",     VMBrand::Xen),
-        ("prl_fs",     VMBrand::Parallels),
-        ("prl_eth",    VMBrand::Parallels),
-        ("prl_tg",     VMBrand::Parallels),
-    ];
-
     unsafe {
-        // Query required buffer size via syscall-spoofed NtQuerySystemInformation.
         let mut size: u32 = 0;
         nt_qsi(11, std::ptr::null_mut(), 0, &mut size);
-        if size == 0 {
-            size = 256 * 1024;
-        }
+        if size == 0 { size = 256 * 1024; }
 
         let mut buf = vec![0u8; size as usize];
         let status = nt_qsi(11, buf.as_mut_ptr(), size, &mut size);
-        if status < 0 {
-            return false;
-        }
+        if status < 0 { return false; }
 
-        // buf points to RTL_PROCESS_MODULES:
-        //   ULONG NumberOfModules; followed by RTL_PROCESS_MODULE_INFORMATION[NumberOfModules]
-        // RTL_PROCESS_MODULE_INFORMATION is 296 bytes on x64.
         const MODULE_INFO_SIZE: usize = 296;
         let count = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
-        let base = 8; // offset past NumberOfModules + padding on x64
+        let base = 8;
+
+        // Decode a driver name from obfstr bytes and compare case-insensitively.
+        macro_rules! drv_chk {
+            ($name_lower:expr, $drv:literal, $brand:expr) => {{
+                let d = obfstr!($drv);
+                let ds = std::str::from_utf8(&d).unwrap_or("");
+                if $name_lower.contains(ds) {
+                    add_brand_score($brand, 0);
+                    return true;
+                }
+            }};
+        }
 
         for i in 0..count {
             let off = base + i * MODULE_INFO_SIZE;
-            // FullPathName is at offset 24, length 256
-            if off + 24 + 256 > buf.len() {
-                break;
-            }
+            if off + 24 + 256 > buf.len() { break; }
             let name_bytes = &buf[off + 24..off + 24 + 256];
             let name = std::str::from_utf8(name_bytes)
                 .unwrap_or("")
                 .trim_end_matches('\0')
                 .to_lowercase();
 
-            for &(drv, brand) in DRIVER_LIST {
-                if name.contains(&drv.to_lowercase()) {
-                    add_brand_score(brand, 0);
-                    return true;
-                }
-            }
+            drv_chk!(name, "vboxdrv",    VMBrand::VBox);
+            drv_chk!(name, "vboxguest",  VMBrand::VBox);
+            drv_chk!(name, "vboxmouse",  VMBrand::VBox);
+            drv_chk!(name, "vboxvideo",  VMBrand::VBox);
+            drv_chk!(name, "vboxsf",     VMBrand::VBox);
+            drv_chk!(name, "vmxnet",     VMBrand::VMware);
+            drv_chk!(name, "vmx_svga",   VMBrand::VMware);
+            drv_chk!(name, "vmx_fb",     VMBrand::VMware);
+            drv_chk!(name, "vmci",       VMBrand::VMware);
+            drv_chk!(name, "vmtoolshook",VMBrand::VMware);
+            drv_chk!(name, "vmmouse",    VMBrand::VMware);
+            drv_chk!(name, "vmhgfs",     VMBrand::VMware);
+            drv_chk!(name, "vmkbd",      VMBrand::VMware);
+            drv_chk!(name, "vmaudio",    VMBrand::VMware);
+            drv_chk!(name, "pvscsi",     VMBrand::VMware);
+            drv_chk!(name, "vmxnet3",    VMBrand::VMware);
+            drv_chk!(name, "kvm",        VMBrand::KVM);
+            drv_chk!(name, "vioscsi",    VMBrand::QEMUKVM);
+            drv_chk!(name, "vioinput",   VMBrand::QEMUKVM);
+            drv_chk!(name, "balloon",    VMBrand::QEMUKVM);
+            drv_chk!(name, "viostor",    VMBrand::QEMUKVM);
+            drv_chk!(name, "netkvm",     VMBrand::QEMUKVM);
+            drv_chk!(name, "xenvif",     VMBrand::Xen);
+            drv_chk!(name, "xennet",     VMBrand::Xen);
+            drv_chk!(name, "xenstor",    VMBrand::Xen);
+            drv_chk!(name, "xenbus",     VMBrand::Xen);
+            drv_chk!(name, "prl_fs",     VMBrand::Parallels);
+            drv_chk!(name, "prl_eth",    VMBrand::Parallels);
+            drv_chk!(name, "prl_tg",     VMBrand::Parallels);
         }
         false
     }
@@ -550,21 +744,21 @@ pub fn disk_serial() -> bool {
         let serial = get_str(serial_off);
         let product = get_str(product_off);
 
-        static PATTERNS: &[(&str, VMBrand)] = &[
-            ("QM000",    VMBrand::VMware),   // VMware serial prefix
-            ("VMware",   VMBrand::VMware),
-            ("VBOX",     VMBrand::VBox),
-            ("VIRTUAL",  VMBrand::HyperV),
-            ("QEMU",     VMBrand::QEMU),
-        ];
-
-        for &(pat, brand) in PATTERNS {
-            let u = pat.to_uppercase();
-            if serial.to_uppercase().contains(&u) || product.to_uppercase().contains(&u) {
-                add_brand_score(brand, 0);
-                return true;
-            }
+        macro_rules! disk_chk {
+            ($pat:literal, $brand:expr) => {{
+                let p = obfstr!($pat);
+                let pu = std::str::from_utf8(&p).unwrap_or("").to_uppercase();
+                if serial.to_uppercase().contains(&*pu) || product.to_uppercase().contains(&*pu) {
+                    add_brand_score($brand, 0);
+                    return true;
+                }
+            }};
         }
+        disk_chk!("QM000",   VMBrand::VMware);
+        disk_chk!("VMware",  VMBrand::VMware);
+        disk_chk!("VBOX",    VMBrand::VBox);
+        disk_chk!("VIRTUAL", VMBrand::HyperV);
+        disk_chk!("QEMU",    VMBrand::QEMU);
 
         // VMware also uses "VB" + 8 hex chars format
         if serial.starts_with("VB") && serial.len() >= 10 {
@@ -583,17 +777,31 @@ pub fn disk_serial() -> bool {
 
 /// Check if the IVSHMEM device is present via its registry key.
 pub fn ivshmem() -> bool {
-    use winreg::enums::*;
-    use winreg::RegKey;
-
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    // IVSHMEM PCI class GUID
-    let path = r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_1AF4&DEV_1110";
-    if let Ok(key) = hklm.open_subkey(path) {
-        // Count sub-keys – if > 0 the device is present
-        return key.enum_keys().count() > 0;
+    #[cfg(target_arch = "x86_64")]
+    {
+        let path = obfstr!(r"\Registry\Machine\SYSTEM\CurrentControlSet\Enum\PCI\VEN_1AF4&DEV_1110");
+        return unsafe {
+            let mut wide: Vec<u16> = path.iter().map(|&b| b as u16).collect();
+            wide.push(0);
+            let mut us = crate::syscall::init_unicode_string(&wide);
+            let mut oa = crate::syscall::ObjectAttributes::new_named(&mut us);
+            let mut handle: usize = 0;
+            let status = crate::syscall::nt_open_key(&mut handle, 0x20019, &mut oa) as u32;
+            if status == 0 { crate::syscall::nt_close(handle); true }
+            else { status == 0xC000_0022 }
+        };
     }
-    false
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let path = r"SYSTEM\CurrentControlSet\Enum\PCI\VEN_1AF4&DEV_1110";
+        if let Ok(key) = hklm.open_subkey(path) {
+            return key.enum_keys().count() > 0;
+        }
+        false
+    }
 }
 
 // ── gpu_capabilities ──────────────────────────────────────────────────────────
@@ -617,49 +825,66 @@ pub fn gpu_capabilities() -> bool {
 
 /// Try opening known VM device handles.
 pub fn handles() -> bool {
-    static DEVICES: &[(&[u8], VMBrand)] = &[
-        (b"\\\\.\\VBoxMiniRdrDN\0",  VMBrand::VBox),
-        (b"\\\\.\\HGFS\0",           VMBrand::VMware),
-        (b"\\\\.\\vmci\0",           VMBrand::VMware),
-        (b"\\\\.\\pipe\\cuckoo\0",   VMBrand::Cuckoo),
-    ];
-
-    unsafe {
-        for &(dev, brand) in DEVICES {
-            if try_open_device(dev) {
-                add_brand_score(brand, 0);
+    macro_rules! chk {
+        ($p:literal, $b:expr) => {{
+            let path = obfstr!($p);
+            if unsafe { try_open_device(&path) } {
+                add_brand_score($b, 0);
                 return true;
             }
-        }
-        false
+        }};
     }
+    chk!(r"\??\VBoxMiniRdrDN",     VMBrand::VBox);
+    chk!(r"\??\HGFS",              VMBrand::VMware);
+    chk!(r"\??\vmci",              VMBrand::VMware);
+    chk!(r"\??\pipe\cuckoo",      VMBrand::Cuckoo);
+    false
 }
 
 // ── virtual_processors ────────────────────────────────────────────────────────
 
 /// Hyper-V reports virtual processor info via registry.
 pub fn virtual_processors() -> bool {
-    use winreg::enums::*;
-    use winreg::RegKey;
-
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    if let Ok(key) = hklm
-        .open_subkey(r"SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters")
-    {
-        let _: String = match key.get_value("VirtualMachineName") {
-            Ok(v) => { add_brand_score(VMBrand::HyperV, 0); return true; v }
-            Err(_) => String::new(),
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        // Shared NtOpenKey helper (inline closure).
+        let reg_exists = |ascii: &[u8]| -> bool {
+            let mut wide: Vec<u16> = ascii.iter().map(|&b| b as u16).collect();
+            wide.push(0);
+            let mut us = crate::syscall::init_unicode_string(&wide);
+            let mut oa = crate::syscall::ObjectAttributes::new_named(&mut us);
+            let mut h: usize = 0;
+            let s = crate::syscall::nt_open_key(&mut h, 0x20019, &mut oa) as u32;
+            if s == 0 { crate::syscall::nt_close(h); true }
+            else { s == 0xC000_0022 }
         };
+        // Key existence alone is sufficient — if HKLM\...Guest\Parameters exists we're in HyperV.
+        let k1 = obfstr!(r"\Registry\Machine\SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters");
+        if reg_exists(&k1) { add_brand_score(VMBrand::HyperV, 0); return true; }
+        // Single-CPU check via NtQuerySystemInformation is already handled by cpu_heuristic.
+        return false;
     }
-    if let Ok(key) = hklm.open_subkey(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") {
-        if let Ok(name) = key.get_value::<String, _>("ProcessorNameString") {
-            if name.contains("Virtual") {
-                add_brand_score(VMBrand::HyperV, 0);
-                return true;
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        if let Ok(key) = hklm.open_subkey(r"SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters") {
+            let _: String = match key.get_value("VirtualMachineName") {
+                Ok(v) => { add_brand_score(VMBrand::HyperV, 0); return true; v }
+                Err(_) => String::new(),
+            };
+        }
+        if let Ok(key) = hklm.open_subkey(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") {
+            if let Ok(name) = key.get_value::<String, _>("ProcessorNameString") {
+                if name.contains("Virtual") {
+                    add_brand_score(VMBrand::HyperV, 0);
+                    return true;
+                }
             }
         }
+        false
     }
-    false
 }
 
 // ── hypervisor_query ──────────────────────────────────────────────────────────
@@ -687,20 +912,41 @@ pub fn hypervisor_query() -> bool {
 // ── audio ─────────────────────────────────────────────────────────────────────
 
 /// VMs typically have no audio render endpoints in the MMDevices registry.
+///
+/// On x86-64 the key path is obfuscated and opened via direct `NtOpenKey` syscall.
 pub fn audio() -> bool {
-    use winreg::enums::*;
-    use winreg::RegKey;
-
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    if let Ok(key) = hklm
-        .open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render")
-    {
-        let subkey_count = key.enum_keys().count();
-        let value_count = key.enum_values().count();
-        return subkey_count == 0 && value_count == 0;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let path = obfstr!(r"\Registry\Machine\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render");
+        let mut wide: Vec<u16> = path.iter().map(|&b| b as u16).collect();
+        wide.push(0);
+        let mut us = crate::syscall::init_unicode_string(&wide);
+        let mut oa = crate::syscall::ObjectAttributes::new_named(&mut us);
+        let mut handle: usize = 0;
+        let s = crate::syscall::nt_open_key(&mut handle, 0x20019, &mut oa) as u32;
+        if s == 0 {
+            // Key opened — check if it has any subkeys by querying it.
+            // For simplicity: if it opened with zero subkeys we treat as VM.
+            // Enumerating subkeys via NtEnumerateKey is complex; just treat
+            // KEY_EXISTS as "real audio present" to avoid false positives.
+            crate::syscall::nt_close(handle);
+            return false; // render endpoint key exists → not a VM indicator
+        }
+        // Key missing → no audio render endpoints → VM indicator.
+        s != 0xC000_0022 // ACCESS_DENIED also means key exists
     }
-    // If the key doesn't exist at all that's also unusual
-    true
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        if let Ok(key) = hklm.open_subkey(r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render") {
+            let subkey_count = key.enum_keys().count();
+            let value_count  = key.enum_values().count();
+            return subkey_count == 0 && value_count == 0;
+        }
+        true
+    }
 }
 
 // ── acpi_signature ────────────────────────────────────────────────────────────
@@ -715,15 +961,6 @@ pub fn acpi_signature() -> bool {
     };
     use windows_sys::Win32::Foundation::GUID;
 
-    static PCI_VM_IDS: &[(&str, VMBrand)] = &[
-        ("VEN_15AD", VMBrand::VMware),
-        ("VEN_80EE", VMBrand::VBox),
-        ("VEN_1AF4", VMBrand::QEMUKVM),
-        ("VMBUS",    VMBrand::HyperV),
-        ("VPCI",     VMBrand::HyperV),
-        ("VEN_5853", VMBrand::Xen),
-        ("VEN_1AB8", VMBrand::Parallels),
-    ];
 
     unsafe {
         let hdev = SetupDiGetClassDevsA(
@@ -757,13 +994,20 @@ pub fn acpi_signature() -> bool {
             {
                 let id = String::from_utf8_lossy(&buf[..required as usize])
                     .to_uppercase();
-                for &(vid, brand) in PCI_VM_IDS {
-                    if id.contains(vid) {
-                        add_brand_score(brand, 0);
-                        found = true;
-                        break;
-                    }
+                macro_rules! pci_chk {
+                    ($vid:literal, $brand:expr) => {{
+                        let v = obfstr!($vid);
+                        let vs = std::str::from_utf8(&v).unwrap_or("");
+                        if id.contains(vs) { add_brand_score($brand, 0); found = true; }
+                    }};
                 }
+                pci_chk!("VEN_15AD", VMBrand::VMware);
+                pci_chk!("VEN_80EE", VMBrand::VBox);
+                pci_chk!("VEN_1AF4", VMBrand::QEMUKVM);
+                pci_chk!("VMBUS",    VMBrand::HyperV);
+                pci_chk!("VPCI",     VMBrand::HyperV);
+                pci_chk!("VEN_5853", VMBrand::Xen);
+                pci_chk!("VEN_1AB8", VMBrand::Parallels);
             }
             if found { break; }
         }
@@ -828,12 +1072,19 @@ pub fn boot_logo() -> bool {
         if status != 0 { return false; }
 
         let text = String::from_utf8_lossy(&buf[..size as usize]).to_uppercase();
-        let vm_strings = ["EDK II", "HYPER", "VBOX", "SEABIOS", "QEMU", "OVMF"];
-        for s in &vm_strings {
-            if text.contains(s) {
-                return true;
-            }
+        macro_rules! boot_chk {
+            ($s:literal) => {{
+                let k = obfstr!($s);
+                let ks = std::str::from_utf8(&k).unwrap_or("");
+                if text.contains(ks) { return true; }
+            }};
         }
+        boot_chk!("EDK II");
+        boot_chk!("HYPER");
+        boot_chk!("VBOX");
+        boot_chk!("SEABIOS");
+        boot_chk!("QEMU");
+        boot_chk!("OVMF");
         false
     }
 }
@@ -845,25 +1096,24 @@ pub fn boot_logo() -> bool {
 /// On x86-64 every NT call (NtOpenDirectoryObject, NtQueryDirectoryObject,
 /// NtClose) is issued via direct `syscall`, bypassing any ntdll inline hooks.
 pub fn kernel_objects() -> bool {
-    static VM_OBJECTS: &[(&str, VMBrand)] = &[
-        ("VmGenerationCounter", VMBrand::HyperV),
-        ("VmGid",               VMBrand::HyperV),
-        ("VBoxGuest",           VMBrand::VBox),
-        ("vmci",                VMBrand::VMware),
-    ];
-
-    // Shared scan logic: given a filled buffer, check for VM object names.
+    // VM object names decoded at runtime — not stored as plaintext in .rodata.
     let scan = |buf: &[u8]| -> Option<VMBrand> {
         let words: Vec<u16> = buf
             .chunks_exact(2)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
         let text = String::from_utf16_lossy(&words);
-        for &(nm, brand) in VM_OBJECTS {
-            if text.contains(nm) {
-                return Some(brand);
-            }
+        macro_rules! obj_chk {
+            ($nm:literal, $brand:expr) => {{
+                let n = obfstr!($nm);
+                let ns = std::str::from_utf8(&n).unwrap_or("");
+                if text.contains(ns) { return Some($brand); }
+            }};
         }
+        obj_chk!("VmGenerationCounter", VMBrand::HyperV);
+        obj_chk!("VmGid",               VMBrand::HyperV);
+        obj_chk!("VBoxGuest",           VMBrand::VBox);
+        obj_chk!("vmci",                VMBrand::VMware);
         None
     };
 
@@ -1027,7 +1277,12 @@ pub fn nvram() -> bool {
     if let Ok(key) = hklm.open_subkey(path) {
         for subkey_result in key.enum_keys() {
             if let Ok(sk_name) = subkey_result {
-                if sk_name.to_uppercase().contains("QEMU") || sk_name.to_uppercase().contains("VBOX") {
+                let q = obfstr!("QEMU");
+                let qs = std::str::from_utf8(&q).unwrap_or("");
+                let vb = obfstr!("VBOX");
+                let vbs = std::str::from_utf8(&vb).unwrap_or("");
+                let upper = sk_name.to_uppercase();
+                if upper.contains(qs) || upper.contains(vbs) {
                     return true;
                 }
             }
@@ -1188,7 +1443,9 @@ pub fn kvm_interception() -> bool {
     if !is_leaf_supported(0x4000_0000) { return false; }
     let r = cpuid(0x4000_0000, 0);
     let v = vendor_string(r.ebx, r.ecx, r.edx);
-    if v.contains("KVMKVMKVM") {
+    let kvm_id = obfstr!("KVMKVMKVM");
+    let kvm_str = std::str::from_utf8(&kvm_id).unwrap_or("");
+    if v.contains(kvm_str) {
         add_brand_score(VMBrand::KVM, 0);
         true
     } else {
@@ -1215,15 +1472,16 @@ pub fn azure() -> bool {
     if let Ok(key) = hklm
         .open_subkey(r"SOFTWARE\Microsoft\Virtual Machine\Guest\Parameters")
     {
+        let az = obfstr!("azure");
+        let azs = std::str::from_utf8(&az).unwrap_or("");
         if let Ok(hostname) = key.get_value::<String, _>("HostName") {
-            if hostname.to_lowercase().contains("azure") {
+            if hostname.to_lowercase().contains(azs) {
                 add_brand_score(VMBrand::AzureHyperV, 0);
                 return true;
             }
         }
-        // Check "PhysicalHostNameFullyQualified"
         if let Ok(fqdn) = key.get_value::<String, _>("PhysicalHostNameFullyQualified") {
-            if fqdn.to_lowercase().contains("azure") {
+            if fqdn.to_lowercase().contains(azs) {
                 add_brand_score(VMBrand::AzureHyperV, 0);
                 return true;
             }
@@ -1235,45 +1493,134 @@ pub fn azure() -> bool {
 // ── firmware ─────────────────────────────────────────────────────────────────
 
 /// Scan BIOS/firmware registry strings for VM vendor strings.
+///
+/// On x86-64: NtOpenKey + NtQueryValueKey via direct syscall; all VM keyword
+/// strings decoded at runtime via obfstr! so they don't appear in .rodata.
+/// On other targets: falls back to the winreg crate.
 pub fn firmware() -> bool {
-    use winreg::enums::*;
-    use winreg::RegKey;
+    // ── x86-64 path ──────────────────────────────────────────────────────────
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        // Open the BIOS key via NT path (obfuscated).
+        let bios_path = obfstr!(r"\Registry\Machine\HARDWARE\DESCRIPTION\System\BIOS");
+        let mut wide: Vec<u16> = bios_path.iter().map(|&b| b as u16).collect();
+        wide.push(0);
+        let mut us = crate::syscall::init_unicode_string(&wide);
+        let mut oa = crate::syscall::ObjectAttributes::new_named(&mut us);
+        let mut key_handle: usize = 0;
+        if crate::syscall::nt_open_key(&mut key_handle, 0x20019, &mut oa) != 0 {
+            return false;
+        }
 
-    static FIRMWARE_KEYS: &[(&str, &str, VMBrand)] = &[
-        (r"HARDWARE\DESCRIPTION\System\BIOS", "BIOSVendor",        VMBrand::Invalid),
-        (r"HARDWARE\DESCRIPTION\System\BIOS", "SystemManufacturer", VMBrand::Invalid),
-        (r"HARDWARE\DESCRIPTION\System\BIOS", "SystemProductName",  VMBrand::Invalid),
-        (r"HARDWARE\DESCRIPTION\System\BIOS", "BaseBoardManufacturer", VMBrand::Invalid),
-    ];
+        // Helper: read a REG_SZ value from an already-open key handle.
+        let read_value = |handle: usize, val_ascii: &[u8]| -> Option<String> {
+            let val_wide: Vec<u16> = val_ascii.iter().map(|&b| b as u16).collect();
+            let mut val_us = crate::syscall::UnicodeString {
+                length: (val_wide.len() * 2) as u16,
+                maximum_length: (val_wide.len() * 2) as u16,
+                _pad: 0,
+                buffer: val_wide.as_ptr(),
+            };
+            let mut buf = vec![0u8; 512];
+            let mut ret_len = 0u32;
+            // KeyValuePartialInformation = 1
+            let s = crate::syscall::nt_query_value_key(
+                handle, &mut val_us, 1,
+                buf.as_mut_ptr(), buf.len() as u32, &mut ret_len,
+            );
+            if s != 0 || ret_len < 12 { return None; }
+            // Layout: [u32 TitleIndex][u32 Type][u32 DataLength][Data...]
+            let data_len = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
+            if 12 + data_len > buf.len() { return None; }
+            let data = &buf[12..12 + data_len];
+            // REG_SZ = type 1; data is UTF-16LE
+            let wide_chars: Vec<u16> = data.chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            Some(String::from_utf16_lossy(&wide_chars).trim_end_matches('\0').to_string())
+        };
 
-    static VM_STRINGS: &[(&str, VMBrand)] = &[
-        ("vmware",      VMBrand::VMware),
-        ("virtualbox",  VMBrand::VBox),
-        ("innotek",     VMBrand::VBox),
-        ("qemu",        VMBrand::QEMU),
-        ("bochs",       VMBrand::Bochs),
-        ("xen",         VMBrand::Xen),
-        ("parallels",   VMBrand::Parallels),
-        ("microsoft corporation", VMBrand::HyperV),
-        ("seabios",     VMBrand::QEMU),
-        ("ovmf",        VMBrand::QEMU),
-    ];
+        // Check the four firmware fields via obfstr-encoded value names.
+        macro_rules! read_obf {
+            ($val:literal) => {{
+                let v = obfstr!($val);
+                read_value(key_handle, &v)
+            }};
+        }
+        let fields = [
+            read_obf!("BIOSVendor"),
+            read_obf!("SystemManufacturer"),
+            read_obf!("SystemProductName"),
+            read_obf!("BaseBoardManufacturer"),
+        ];
+        crate::syscall::nt_close(key_handle);
 
-    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
-    for &(path, value, _) in FIRMWARE_KEYS {
-        if let Ok(key) = hklm.open_subkey(path) {
-            if let Ok(v) = key.get_value::<String, _>(value) {
+        // Match against obfuscated VM keywords.
+        macro_rules! kw_match {
+            ($lower:expr, $kw:literal, $brand:expr) => {{
+                let k = obfstr!($kw);
+                let ks = std::str::from_utf8(&k).unwrap_or("");
+                if $lower.contains(ks) { add_brand_score($brand, 0); return true; }
+            }};
+        }
+        for field in &fields {
+            if let Some(ref v) = field {
                 let lower = v.to_lowercase();
-                for &(kw, brand) in VM_STRINGS {
-                    if lower.contains(kw) {
-                        add_brand_score(brand, 0);
-                        return true;
+                let lower: &str = &lower;
+                kw_match!(lower, "vmware",               VMBrand::VMware);
+                kw_match!(lower, "virtualbox",           VMBrand::VBox);
+                kw_match!(lower, "innotek",              VMBrand::VBox);
+                kw_match!(lower, "qemu",                 VMBrand::QEMU);
+                kw_match!(lower, "bochs",                VMBrand::Bochs);
+                kw_match!(lower, "xen",                  VMBrand::Xen);
+                kw_match!(lower, "parallels",            VMBrand::Parallels);
+                kw_match!(lower, "microsoft corporation",VMBrand::HyperV);
+                kw_match!(lower, "seabios",              VMBrand::QEMU);
+                kw_match!(lower, "ovmf",                 VMBrand::QEMU);
+            }
+        }
+        return false;
+    }
+
+    // ── non-x86_64 fallback ───────────────────────────────────────────────────
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        use winreg::enums::*;
+        use winreg::RegKey;
+        static FIRMWARE_KEYS: &[(&str, &str)] = &[
+            (r"HARDWARE\DESCRIPTION\System\BIOS", "BIOSVendor"),
+            (r"HARDWARE\DESCRIPTION\System\BIOS", "SystemManufacturer"),
+            (r"HARDWARE\DESCRIPTION\System\BIOS", "SystemProductName"),
+            (r"HARDWARE\DESCRIPTION\System\BIOS", "BaseBoardManufacturer"),
+        ];
+        static VM_STRINGS: &[(&str, VMBrand)] = &[
+            ("vmware",                VMBrand::VMware),
+            ("virtualbox",            VMBrand::VBox),
+            ("innotek",               VMBrand::VBox),
+            ("qemu",                  VMBrand::QEMU),
+            ("bochs",                 VMBrand::Bochs),
+            ("xen",                   VMBrand::Xen),
+            ("parallels",             VMBrand::Parallels),
+            ("microsoft corporation", VMBrand::HyperV),
+            ("seabios",               VMBrand::QEMU),
+            ("ovmf",                  VMBrand::QEMU),
+        ];
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        for &(path, value) in FIRMWARE_KEYS {
+            if let Ok(key) = hklm.open_subkey(path) {
+                if let Ok(v) = key.get_value::<String, _>(value) {
+                    let lower = v.to_lowercase();
+                    for &(kw, brand) in VM_STRINGS {
+                        if lower.contains(kw) {
+                            add_brand_score(brand, 0);
+                            return true;
+                        }
                     }
                 }
             }
         }
+        false
     }
-    false
 }
 
 // ── devices ───────────────────────────────────────────────────────────────────

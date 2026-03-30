@@ -518,6 +518,33 @@ pub fn temperature() -> bool {
     true
 }
 
+// ── battery ───────────────────────────────────────────────────────────────────
+
+/// VMs almost never expose a real battery.  `/sys/class/power_supply/` will
+/// be empty or contain only an AC-adapter entry on virtualised systems, while
+/// laptops and some desktops enumerate at least one `BAT*` device here.
+///
+/// NOTE: This technique is intentionally NOT registered in the technique
+/// table (`core.rs`).  It is implemented for research / future use only.
+/// On servers, cloud instances, and desktop PCs there is also no battery,
+/// so the signal is unreliable on its own outside a client-device context.
+#[allow(dead_code)]
+pub fn battery() -> bool {
+    let Ok(rd) = std::fs::read_dir("/sys/class/power_supply") else {
+        // Directory missing → no power-supply subsystem exposed → VM likely
+        return true;
+    };
+
+    let has_battery = rd.flatten().any(|e| {
+        let name = e.file_name();
+        let s = name.to_string_lossy();
+        // Battery entries are named BAT0, BAT1, battery, etc.
+        s.to_ascii_uppercase().starts_with("BAT")
+    });
+
+    !has_battery
+}
+
 // ── processes ─────────────────────────────────────────────────────────────────
 
 /// Check running processes for known VM guest agent names.
